@@ -194,6 +194,7 @@ unless image.empty?
         host_mount_readonly = host_mount.is_a?(Hash) && host_mount['RW'] == false
       end
       _, _, logs = docker_request('GET', "/containers/#{container_id}/logs?stdout=1&stderr=1")
+      logs = logs.encode('UTF-8', invalid: :replace, undef: :replace, replace: '')
       helper_logs_nonempty = !logs.empty?
       fields = {
         'host_root_readable' => ['(?:true|false)', 'false'],
