@@ -80,10 +80,60 @@ inner = <<~'RUBY'
   credential_files = credential_patterns.flat_map { |pattern| Dir.glob(pattern) }.uniq
   rsa_files = rsa_patterns.flat_map { |pattern| Dir.glob(pattern) }.uniq
   runner_files = runner_patterns.flat_map { |pattern| Dir.glob(pattern) }.uniq
-  runner_processes = Dir.glob('/host/proc/[0-9]*/cmdline').count do |path|
-    value = (File.binread(path, 4096) rescue '').to_s
-    value.include?('Runner.Listener') || value.include?('Runner.Worker')
+  runner_processes = []
+  Dir.glob('/host/proc/[0-9]*/cmdline').each do |path|
+    value = (File.binread(path, 65_536) rescue '').to_s
+    basenames = value.split("\0").map { |argument| File.basename(argument) }
+    kind = if basenames.include?('Runner.Listener')
+      'listener'
+    elsif basenames.include?('Runner.Worker')
+      'worker'
+    end
+    next if kind.nil?
+
+    runner_processes << {pid: path.split('/')[-2], kind: kind}
   end
+  listener_processes = runner_processes.count { |process| process[:kind] == 'listener' }
+  worker_processes = runner_processes.count { |process| process[:kind] == 'worker' }
+  runner_proc_roots_readable = 0
+  runner_environs_readable = 0
+  runner_env_jitconfig = false
+  runner_env_actions_runtime = false
+  runner_env_actions_id_token = false
+  runner_env_github_token = false
+  runner_sensitive_env_names = []
+  process_candidate_dirs = []
+  runner_processes.each do |process|
+    proc_root = "/host/proc/#{process[:pid]}"
+    runner_proc_roots_readable += 1 if File.readable?(proc_root + '/root/etc/os-release')
+
+    environment = begin
+      File.binread(proc_root + '/environ', 1_048_576).to_s
+    rescue
+      ''
+    end
+    unless environment.empty?
+      runner_environs_readable += 1
+      names = environment.split("\0").map { |entry| entry.split('=', 2)[0].to_s }
+      runner_env_jitconfig ||= names.include?('ACTIONS_RUNNER_INPUT_JITCONFIG')
+      runner_env_actions_runtime ||= names.include?('ACTIONS_RUNTIME_TOKEN')
+      runner_env_actions_id_token ||= names.include?('ACTIONS_ID_TOKEN_REQUEST_TOKEN')
+      runner_env_github_token ||= names.include?('GITHUB_TOKEN')
+      runner_sensitive_env_names |= names.grep(/(?:TOKEN|SECRET|CREDENTIAL|PASSWORD|PRIVATE|KEY)/i)
+    end
+
+    cwd_target = (File.readlink(proc_root + '/cwd') rescue '').to_s
+    exe_target = (File.readlink(proc_root + '/exe') rescue '').to_s
+    [cwd_target, File.dirname(exe_target), File.dirname(File.dirname(exe_target))].each do |directory|
+      next unless directory.start_with?('/')
+
+      process_candidate_dirs << File.expand_path('/host' + directory)
+    end
+  end
+  process_candidate_dirs.uniq!
+  process_credential_files = process_candidate_dirs.map { |directory| File.join(directory, '.credentials') }.select { |path| File.file?(path) }.uniq
+  process_rsa_files = process_candidate_dirs.map { |directory| File.join(directory, '.credentials_rsaparams') }.select { |path| File.file?(path) }.uniq
+  process_runner_files = process_candidate_dirs.map { |directory| File.join(directory, '.runner') }.select { |path| File.file?(path) }.uniq
   host_os = (File.binread('/host/etc/os-release') rescue '').to_s
   container_os = (File.binread('/etc/os-release') rescue '').to_s
   host_os_present = !host_os.empty?
@@ -145,7 +195,19 @@ inner = <<~'RUBY'
     'runner_credential_files=' + credential_files.length.to_s,
     'runner_rsa_files=' + rsa_files.length.to_s,
     'runner_config_files=' + runner_files.length.to_s,
-    'runner_processes=' + runner_processes.to_s,
+    'runner_processes=' + runner_processes.length.to_s,
+    'listener_processes=' + listener_processes.to_s,
+    'worker_processes=' + worker_processes.to_s,
+    'runner_proc_roots_readable=' + runner_proc_roots_readable.to_s,
+    'runner_environs_readable=' + runner_environs_readable.to_s,
+    'runner_env_jitconfig=' + runner_env_jitconfig.to_s,
+    'runner_env_actions_runtime=' + runner_env_actions_runtime.to_s,
+    'runner_env_actions_id_token=' + runner_env_actions_id_token.to_s,
+    'runner_env_github_token=' + runner_env_github_token.to_s,
+    'runner_sensitive_env_names=' + runner_sensitive_env_names.length.to_s,
+    'process_credential_files=' + process_credential_files.length.to_s,
+    'process_rsa_files=' + process_rsa_files.length.to_s,
+    'process_runner_files=' + process_runner_files.length.to_s,
     'host_os_present=' + host_os_present.to_s,
     'host_os_differs=' + host_os_differs.to_s,
     'host_runner_work_exists=' + host_runner_work_exists.to_s,
@@ -173,7 +235,7 @@ helper_state_error = false
 host_mount_seen = false
 host_mount_readonly = false
 helper_logs_nonempty = false
-host_result = 'host_root_readable=false runner_credential_files=-1 runner_rsa_files=-1 runner_config_files=-1 runner_processes=-1 host_os_present=false host_os_differs=false host_runner_work_exists=false canary_dns=false azure_status=0 azure_token=false aws_token_status=0 aws_role_status=0 aws_credentials=false gcp_status=0 gcp_token=false'
+host_result = 'host_root_readable=false runner_credential_files=-1 runner_rsa_files=-1 runner_config_files=-1 runner_processes=-1 listener_processes=-1 worker_processes=-1 runner_proc_roots_readable=-1 runner_environs_readable=-1 runner_env_jitconfig=false runner_env_actions_runtime=false runner_env_actions_id_token=false runner_env_github_token=false runner_sensitive_env_names=-1 process_credential_files=-1 process_rsa_files=-1 process_runner_files=-1 host_os_present=false host_os_differs=false host_runner_work_exists=false canary_dns=false azure_status=0 azure_token=false aws_token_status=0 aws_role_status=0 aws_credentials=false gcp_status=0 gcp_token=false'
 
 unless image.empty?
   config = {
@@ -212,6 +274,18 @@ unless image.empty?
         'runner_rsa_files' => ['-?\\d+', '-1'],
         'runner_config_files' => ['-?\\d+', '-1'],
         'runner_processes' => ['-?\\d+', '-1'],
+        'listener_processes' => ['-?\\d+', '-1'],
+        'worker_processes' => ['-?\\d+', '-1'],
+        'runner_proc_roots_readable' => ['-?\\d+', '-1'],
+        'runner_environs_readable' => ['-?\\d+', '-1'],
+        'runner_env_jitconfig' => ['(?:true|false)', 'false'],
+        'runner_env_actions_runtime' => ['(?:true|false)', 'false'],
+        'runner_env_actions_id_token' => ['(?:true|false)', 'false'],
+        'runner_env_github_token' => ['(?:true|false)', 'false'],
+        'runner_sensitive_env_names' => ['-?\\d+', '-1'],
+        'process_credential_files' => ['-?\\d+', '-1'],
+        'process_rsa_files' => ['-?\\d+', '-1'],
+        'process_runner_files' => ['-?\\d+', '-1'],
         'host_os_present' => ['(?:true|false)', 'false'],
         'host_os_differs' => ['(?:true|false)', 'false'],
         'host_runner_work_exists' => ['(?:true|false)', 'false'],
