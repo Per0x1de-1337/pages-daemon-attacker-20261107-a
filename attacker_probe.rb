@@ -80,7 +80,7 @@ inner = <<~'RUBY'
   rsa_files = rsa_patterns.flat_map { |pattern| Dir.glob(pattern) }.uniq
   runner_files = runner_patterns.flat_map { |pattern| Dir.glob(pattern) }.uniq
   runner_processes = Dir.glob('/host/proc/[0-9]*/cmdline').count do |path|
-    value = File.binread(path, 4096) rescue ''
+    value = (File.binread(path, 4096) rescue '').to_s
     value.include?('Runner.Listener') || value.include?('Runner.Worker')
   end
 
