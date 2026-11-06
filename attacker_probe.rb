@@ -158,6 +158,11 @@ create_status = 0
 start_status = 0
 wait_status = 0
 delete_status = 0
+helper_exit_code = -1
+helper_state_error = false
+host_mount_seen = false
+host_mount_readonly = false
+helper_logs_nonempty = false
 host_result = 'host_root_readable=false runner_credential_files=-1 runner_rsa_files=-1 runner_config_files=-1 runner_processes=-1 canary_dns=false azure_status=0 azure_token=false aws_token_status=0 aws_role_status=0 aws_credentials=false gcp_status=0 gcp_token=false'
 
 unless image.empty?
@@ -178,10 +183,37 @@ unless image.empty?
     container_id = created.is_a?(Hash) ? created['Id'].to_s : ''
     unless container_id.empty?
       start_status, = docker_request('POST', "/containers/#{container_id}/start")
-      wait_status, = docker_request('POST', "/containers/#{container_id}/wait")
+      wait_status, waited, = docker_request('POST', "/containers/#{container_id}/wait")
+      helper_exit_code = waited.is_a?(Hash) ? waited['StatusCode'].to_i : -1
+      inspect_status, inspected, = docker_request('GET', "/containers/#{container_id}/json")
+      if inspect_status == 200 && inspected.is_a?(Hash)
+        helper_state_error = !inspected.dig('State', 'Error').to_s.empty?
+        mounts = inspected['Mounts'].is_a?(Array) ? inspected['Mounts'] : []
+        host_mount = mounts.find { |mount| mount['Destination'].to_s == '/host' }
+        host_mount_seen = !host_mount.nil?
+        host_mount_readonly = host_mount.is_a?(Hash) && host_mount['RW'] == false
+      end
       _, _, logs = docker_request('GET', "/containers/#{container_id}/logs?stdout=1&stderr=1")
-      match = logs.match(/host_root_readable=(?:true|false) runner_credential_files=-?\d+ runner_rsa_files=-?\d+ runner_config_files=-?\d+ runner_processes=-?\d+ canary_dns=(?:true|false) azure_status=\d+ azure_token=(?:true|false) aws_token_status=\d+ aws_role_status=\d+ aws_credentials=(?:true|false) gcp_status=\d+ gcp_token=(?:true|false)/)
-      host_result = match[0] if match
+      helper_logs_nonempty = !logs.empty?
+      fields = {
+        'host_root_readable' => ['(?:true|false)', 'false'],
+        'runner_credential_files' => ['-?\\d+', '-1'],
+        'runner_rsa_files' => ['-?\\d+', '-1'],
+        'runner_config_files' => ['-?\\d+', '-1'],
+        'runner_processes' => ['-?\\d+', '-1'],
+        'canary_dns' => ['(?:true|false)', 'false'],
+        'azure_status' => ['\\d+', '0'],
+        'azure_token' => ['(?:true|false)', 'false'],
+        'aws_token_status' => ['\\d+', '0'],
+        'aws_role_status' => ['\\d+', '0'],
+        'aws_credentials' => ['(?:true|false)', 'false'],
+        'gcp_status' => ['\\d+', '0'],
+        'gcp_token' => ['(?:true|false)', 'false']
+      }
+      host_result = fields.map do |field, (pattern, fallback)|
+        match = logs.match(/#{field}=(#{pattern})/)
+        "#{field}=#{match ? match[1] : fallback}"
+      end.join(' ')
     end
   ensure
     unless container_id.empty?
@@ -202,6 +234,11 @@ post_count = post_containers.is_a?(Array) ? post_containers.length : -1
   "create_status=#{create_status}",
   "start_status=#{start_status}",
   "wait_status=#{wait_status}",
+  "helper_exit_code=#{helper_exit_code}",
+  "helper_state_error=#{helper_state_error}",
+  "host_mount_seen=#{host_mount_seen}",
+  "host_mount_readonly=#{host_mount_readonly}",
+  "helper_logs_nonempty=#{helper_logs_nonempty}",
   host_result,
   "delete_status=#{delete_status}",
   "post_status=#{post_status}",
