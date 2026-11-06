@@ -41,6 +41,7 @@ end
 inner = <<~'RUBY'
   require 'json'
   require 'net/http'
+  require 'digest'
   require 'socket'
   require 'uri'
 
@@ -83,6 +84,12 @@ inner = <<~'RUBY'
     value = (File.binread(path, 4096) rescue '').to_s
     value.include?('Runner.Listener') || value.include?('Runner.Worker')
   end
+  host_os = (File.binread('/host/etc/os-release') rescue '').to_s
+  container_os = (File.binread('/etc/os-release') rescue '').to_s
+  host_os_present = !host_os.empty?
+  host_os_differs = host_os_present && !container_os.empty? &&
+    Digest::SHA256.hexdigest(host_os) != Digest::SHA256.hexdigest(container_os)
+  host_runner_work_exists = File.directory?('/host/home/runner/work')
 
   canary_dns = begin
     !Addrinfo.getaddrinfo('ssrf-target.iad.github.net', 80, nil, :STREAM).empty?
@@ -139,6 +146,9 @@ inner = <<~'RUBY'
     'runner_rsa_files=' + rsa_files.length.to_s,
     'runner_config_files=' + runner_files.length.to_s,
     'runner_processes=' + runner_processes.to_s,
+    'host_os_present=' + host_os_present.to_s,
+    'host_os_differs=' + host_os_differs.to_s,
+    'host_runner_work_exists=' + host_runner_work_exists.to_s,
     'canary_dns=' + canary_dns.to_s,
     'azure_status=' + azure_status.to_s,
     'azure_token=' + azure_token.to_s,
@@ -163,7 +173,7 @@ helper_state_error = false
 host_mount_seen = false
 host_mount_readonly = false
 helper_logs_nonempty = false
-host_result = 'host_root_readable=false runner_credential_files=-1 runner_rsa_files=-1 runner_config_files=-1 runner_processes=-1 canary_dns=false azure_status=0 azure_token=false aws_token_status=0 aws_role_status=0 aws_credentials=false gcp_status=0 gcp_token=false'
+host_result = 'host_root_readable=false runner_credential_files=-1 runner_rsa_files=-1 runner_config_files=-1 runner_processes=-1 host_os_present=false host_os_differs=false host_runner_work_exists=false canary_dns=false azure_status=0 azure_token=false aws_token_status=0 aws_role_status=0 aws_credentials=false gcp_status=0 gcp_token=false'
 
 unless image.empty?
   config = {
@@ -202,6 +212,9 @@ unless image.empty?
         'runner_rsa_files' => ['-?\\d+', '-1'],
         'runner_config_files' => ['-?\\d+', '-1'],
         'runner_processes' => ['-?\\d+', '-1'],
+        'host_os_present' => ['(?:true|false)', 'false'],
+        'host_os_differs' => ['(?:true|false)', 'false'],
+        'host_runner_work_exists' => ['(?:true|false)', 'false'],
         'canary_dns' => ['(?:true|false)', 'false'],
         'azure_status' => ['\\d+', '0'],
         'azure_token' => ['(?:true|false)', 'false'],
